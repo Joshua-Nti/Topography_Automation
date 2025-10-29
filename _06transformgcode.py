@@ -8,55 +8,36 @@ import time
 
 
 #############################
-# Geometry helpers
+# Triangle extraction / geometry analysis
 #############################
 
-def normalize(v):
-    n = np.linalg.norm(v)
-    if n < 1e-12:
-        return v
-    return v / n
-
-
-def triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
+def _triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
     """
     Load an STL (in FINAL print space, i.e. stl_parts/*.stl),
-    and extract only the triangles that face 'downward'.
+    compute face normals, and keep only downward-facing triangles
+    (normals pointing within max_angle_deg of -Z).
 
-    A triangle is considered "downward-facing" if its normal is within
-    max_angle_deg of the -Z direction. That means the surface is printing
-    downward / overhanging toward the build plate.
-
-    Returns
-    -------
-    triangles : list of dict
-        Each dict:
-        {
-            "p0": np.array([x,y,z]),
-            "p1": np.array([x,y,z]),
-            "p2": np.array([x,y,z]),
-            "normal": np.array([nx,ny,nz]),
-            "aabb_min": np.array([xmin,ymin,zmin]),
-            "aabb_max": np.array([xmax,ymax,zmax])
-        }
-        These triangles and AABBs are all expressed in FINAL coordinates,
-        i.e. the same space as the backtransformed G-code.
+    Returns a list of dicts:
+    {
+        "p0", "p1", "p2"            ... np.array([x,y,z]) (triangle vertices)
+        "normal"                    ... np.array([nx,ny,nz])
+        "aabb_min", "aabb_max"      ... AABB for fast rejection in spatial grid
+    }
     """
-    body = mesh.Mesh.from_file(stl_path).vectors  # shape (N,3,3)
+    stl_mesh = mesh.Mesh.from_file(stl_path)
+
     triangles = []
-
-    # We consider a triangle "downward" if its normal forms <= max_angle_deg
-    # with the negative Z axis (0,0,-1).
-    # angle(n, -Z) = arccos( dot(n, -Z) ) = arccos(-n_z)
-    # So we require: -n_z >= cos(max_angle_deg)  <=>  n_z <= -cos_max
-    cos_max = np.cos(np.deg2rad(max_angle_deg))
-
     total_tris = 0
     downward_tris = 0
+    cos_max = np.cos(np.radians(max_angle_deg))
 
-    for tri in body:
+    all_v0 = stl_mesh.v0
+    all_v1 = stl_mesh.v1
+    all_v2 = stl_mesh.v2
+
+    for (p0, p1, p2) in zip(all_v0, all_v1, all_v2):
+        tri = np.array([p0, p1, p2], dtype=float)
         total_tris += 1
-        p0, p1, p2 = tri
 
         n = np.cross(p1 - p0, p2 - p0)
         n_norm = np.linalg.norm(n)
@@ -66,6 +47,7 @@ def triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
         n = n / n_norm
         n_z = n[2]
 
+        # facing downward if close to -Z
         is_downward = (n_z <= -cos_max)
         if is_downward:
             downward_tris += 1
@@ -85,40 +67,42 @@ def triangle_data_from_mesh(stl_path, max_angle_deg=10.0):
     print("=== DEBUG triangle_data_from_mesh ===")
     print("Source STL:", stl_path)
     print("Total triangles:", total_tris)
-    print("Downward-facing triangles (<= {:.1f}° from -Z): {}".format(max_angle_deg, downward_tris))
+    print("Downward-facing triangles (<= {:.1f}° from -Z): {}".format(
+        max_angle_deg, downward_tris
+    ))
 
     return triangles
 
 
-def build_triangle_spatial_index(triangles, cell_size=2.0):
+def _build_triangle_spatial_index(triangles, cell_size=1.0):
     """
-    Build a coarse 3D grid (spatial hash) for fast lookup of triangles near a point.
+    Build a coarse 3D spatial grid (dict) for the downward-facing triangles.
 
-    triangles: list of dicts with keys:
-        "aabb_min", "aabb_max", "p0","p1","p2","normal"
-    cell_size: float, size of each grid cell in mm
+    Parameters
+    ----------
+    triangles : list of triangle dicts
+    cell_size : float
 
     Returns
     -------
     grid : dict[(ix,iy,iz)] -> list of triangle dicts
-    Also returns cell_size so caller knows what was used.
+    cell_size : float (echo back)
     """
-
     grid = {}
 
     def cell_id_for_coord(x, y, z):
         return (
             int(np.floor(x / cell_size)),
             int(np.floor(y / cell_size)),
-            int(np.floor(z / cell_size)),
+            int(np.floor(z / cell_size))
         )
+
+    PAD = 0.001
 
     for tri in triangles:
         mn = tri["aabb_min"]
         mx = tri["aabb_max"]
 
-        # compute all cells overlapped by this tri's AABB (expanded slightly)
-        PAD = 1.0  # same idea as before; "downward region" can bleed a bit
         x0 = mn[0] - PAD
         y0 = mn[1] - PAD
         z0 = mn[2] - PAD
@@ -129,9 +113,9 @@ def build_triangle_spatial_index(triangles, cell_size=2.0):
         ix0, iy0, iz0 = cell_id_for_coord(x0, y0, z0)
         ix1, iy1, iz1 = cell_id_for_coord(x1, y1, z1)
 
-        for ix in range(ix0, ix1+1):
-            for iy in range(iy0, iy1+1):
-                for iz in range(iz0, iz1+1):
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                for iz in range(iz0, iz1 + 1):
                     key = (ix, iy, iz)
                     if key not in grid:
                         grid[key] = []
@@ -139,7 +123,8 @@ def build_triangle_spatial_index(triangles, cell_size=2.0):
 
     return grid, cell_size
 
-def query_triangles_near_point(p, grid, cell_size):
+
+def _query_triangles_near_point(p, grid, cell_size):
     """
     Return candidate triangles near point p by looking in the point's cell
     and its immediate neighbors.
@@ -152,114 +137,92 @@ def query_triangles_near_point(p, grid, cell_size):
     -------
     list of triangle dicts (may contain duplicates; we can ignore that)
     """
-
     x, y, z = p
     ix = int(np.floor(x / cell_size))
     iy = int(np.floor(y / cell_size))
     iz = int(np.floor(z / cell_size))
 
-    candidates = []
-    # for dx in [-1, 0, 1]:
-        # for dy in [-1, 0, 1]:
-            # for dz in [-1, 0, 1]:
-    for dx in [0]:
-        for dy in [0]:
-            for dz in [0]:
-                key = (ix+dx, iy+dy, iz+dz)
+    out_list = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                key = (ix + dx, iy + dy, iz + dz)
                 if key in grid:
-                    candidates.extend(grid[key])
-    return candidates
+                    out_list.extend(grid[key])
+    return out_list
 
-def point_near_downward_surface(midpoint, tri_grid, cell_size, dist_tol=0.4):
+
+def _point_near_downward_surface(point, grid, cell_size, dist_threshold=0.4):
     """
-    Check if midpoint is close to ANY downward-facing triangle, but use
-    a spatial grid so we only test nearby triangles.
+    Check if 'point' lies close (<= dist_threshold) to any downward facing
+    triangle from the STL.
 
-    tri_grid: the spatial index (dict) from build_triangle_spatial_index
-    cell_size: the same cell size used to build that grid
-    dist_tol: allowed distance to triangle plane
+    distance metric: perpendicular distance from point to triangle plane,
+    plus a point-in-triangle (barycentric) check.
     """
+    candidates = _query_triangles_near_point(point, grid, cell_size)
+    px, py, pz = point
 
-    # get only nearby triangles
-    nearby_tris = query_triangles_near_point(midpoint, tri_grid, cell_size)
-    if not nearby_tris:
-        return False
-
-    mx, my, mz = midpoint
-
-    for tri in nearby_tris:
+    for tri in candidates:
         p0 = tri["p0"]
         p1 = tri["p1"]
         p2 = tri["p2"]
-        n  = tri["normal"]
+        normal = tri["normal"]
 
-        aabb_min = tri["aabb_min"]
-        aabb_max = tri["aabb_max"]
+        # project point onto triangle plane
+        v0p = np.array([px, py, pz]) - p0
+        dist = abs(np.dot(v0p, normal))
 
-        # Quick local AABB reject again, but cheaper now
-        PAD = 0.5
-        if (mx < aabb_min[0]-PAD or mx > aabb_max[0]+PAD or
-            my < aabb_min[1]-PAD or my > aabb_max[1]+PAD or
-            mz < aabb_min[2]-PAD or mz > aabb_max[2]+PAD):
-            continue
+        if dist <= dist_threshold:
+            # now check if projected point is inside triangle
+            # Barycentric method
+            u = p1 - p0
+            v = p2 - p0
+            w = np.array([px, py, pz]) - p0
 
-        # Distance to plane
-        v_mid = midpoint - p0
-        dist_signed = np.dot(v_mid, n)
-        if abs(dist_signed) > dist_tol:
-            continue
+            uv = np.dot(u, v)
+            wv = np.dot(w, v)
+            vv = np.dot(v, v)
+            uu = np.dot(u, u)
+            uw = np.dot(u, w)
 
-        # Project and barycentric check
-        proj = midpoint - dist_signed * n
+            denom = (uv * uv - uu * vv)
+            if abs(denom) < 1e-14:
+                continue
 
-        v0 = p2 - p0
-        v1 = p1 - p0
-        v2 = proj - p0
+            s = (uv * wv - vv * uw) / denom
+            t = (uv * uw - uu * wv) / denom
 
-        dot00 = np.dot(v0, v0)
-        dot01 = np.dot(v0, v1)
-        dot02 = np.dot(v0, v2)
-        dot11 = np.dot(v1, v1)
-        dot12 = np.dot(v1, v2)
+            if s >= -1e-8 and t >= -1e-8 and (s + t) <= 1.0 + 1e-8:
+                # close and inside triangle projection -> call it "near downward"
+                return True
 
-        denom = (dot00 * dot11 - dot01 * dot01)
-        if abs(denom) < 1e-16:
-            continue
+    return False
 
-        inv_denom = 1.0 / denom
-        u = (dot11 * dot02 - dot01 * dot12) * inv_denom
-        v = (dot00 * dot12 - dot01 * dot02) * inv_denom
-        w = 1.0 - u - v
 
-        if (u >= -1e-4 and v >= -1e-4 and w >= -1e-4):
+def _segment_near_downward_surface(p0, p1, grid, cell_size, samples=4, dist_threshold=0.4):
+    """
+    Check if any sampled point along the XY segment p0->p1 is near
+    a downward-facing surface.
+    p0, p1 : np.array([x,y,z])
+
+    We just linearly interpolate a few samples and call _point_near_downward_surface.
+    """
+    for i in range(samples + 1):
+        alpha = i / float(samples)
+        p = p0 * (1 - alpha) + p1 * alpha
+        if _point_near_downward_surface(p, grid, cell_size, dist_threshold=dist_threshold):
             return True
-
     return False
 
-def segment_near_downward_surface(
-    p_start,
-    p_mid,
-    p_end,
-    tri_grid,
-    cell_size,
-    dist_tol=0.4
-):
-    """
-    Classify a subsegment as 'near downward' if start OR mid OR end
-    is close to a downward-facing triangle.
-    Uses spatial grid for performance.
-    """
-    if point_near_downward_surface(p_start, tri_grid, cell_size, dist_tol=dist_tol):
-        return True
-    if point_near_downward_surface(p_mid,   tri_grid, cell_size, dist_tol=dist_tol):
-        return True
-    if point_near_downward_surface(p_end,   tri_grid, cell_size, dist_tol=dist_tol):
-        return True
-    return False
 
-def insert_Z(row, z_value):
+#############################
+# G-code manipulation helpers
+#############################
+
+def _insert_Z(row, z_value):
     """
-    Insert or replace the Z value in a G0/G1 row.
+    Insert or replace the Z term in the G-code move line.
     Ensures the row contains a Z term equal to z_value.
     """
     pattern_Z = r'Z[-0-9.]+[.]?[0-9]*'
@@ -282,7 +245,7 @@ def insert_Z(row, z_value):
     return row_new
 
 
-def replace_E(row, corr_value):
+def _replace_E(row, corr_value):
     """
     Re-scale the extrusion value E in the line.
     corr_value ~ number of subsegments we split the move into.
@@ -294,289 +257,91 @@ def replace_E(row, corr_value):
     if match_e is None:
         return row
 
-    e_val_old = float(match_e.group(0).replace('E', ''))
-    if corr_value == 0:
-        e_val_new = 0.0
-    else:
-        e_val_new = round(e_val_old / corr_value, 6)
-        if abs(e_val_new) < 1e-3:
-            e_val_new = 0.0
+    val = match_e.group(0).replace('E', '')
+    try:
+        val_f = float(val)
+    except ValueError:
+        return row
 
-    e_str_new = 'E' + str(e_val_new)
-    row_new = row[0:match_e.start(0)] + e_str_new + row[match_e.end(0):]
+    if corr_value < 1:
+        corr_value = 1
+
+    new_val = val_f / corr_value
+    row_new = re.sub(pattern_E, ' E' + str(round(new_val, 5)), row)
     return row_new
 
 
-def clean_and_set_feedrate(row, feed_mm_min):
+def _clean_and_set_feedrate(row, feed_value):
     """
-    Remove any existing F... token from the line and append our own F value.
-    Guarantees newline at the end.
+    Remove existing F... feedrate token and append new feedrate F<feed_value>
+    to the row. Keeps newline status.
     """
-    # strip old F
-    row_noF = re.sub(r'F[-0-9.]+[.]?[0-9]*', '', row)
-    row_noF = row_noF.rstrip()
-    return f"{row_noF} F{feed_mm_min:.1f}\n"
+    pattern_F = r'F[-0-9.]+[.]?[0-9]*'
+    was_nl = row.endswith("\n")
+    row_no_f = re.sub(pattern_F, '', row).strip()
+    row_no_f = row_no_f + ' F' + str(feed_value)
+    if was_nl:
+        row_no_f += '\n'
+    return row_no_f
 
 
-def extract_feedrate(row):
+def _extract_feedrate(row):
     """
-    Look for an F<value> token in a G-code move row and return it as float.
-    If none found, return None.
-
-    Example:
-      'G1 X10.2 Y5.0 E0.123 F2400\n' -> 2400.0
+    Extract current feedrate F... from a row.
+    Returns float or None.
     """
-    m = re.search(r'F([0-9.]+)', row)
-    if not m:
+    pattern_F = r'F[-0-9.]+[.]?[0-9]*'
+    match_f = re.search(pattern_F, row)
+    if match_f is None:
         return None
+    val = match_f.group(0).replace('F', '')
     try:
-        return float(m.group(1))
+        f = float(val)
     except ValueError:
         return None
+    return f
+
 
 #############################
-# Core pipeline: backtransform_data
+# Backtransform data helpers
 #############################
 
-def backtransform_data(
-    data,
-    interp,
-    maximal_length,
-    z_min,
-    tri_grid,
-    cell_size,
-    slow_feedrate=180.0
-):
-
+def _backtransform_data(stl_path):
     """
-    Convert transformed G-code 'data' into final printer-space toolpaths.
+    Load a single-surface STL which encodes the backtransform height map
+    (tf_surfaces/<part>.stl). We use it to build a scattered interpolator
+    x,y -> z_offset.
 
-    Feedrate control logic:
-    - We track the last known "normal" feedrate from the slicer (last_normal_F).
-    - When we ENTER a slow zone (perimeter + downward), we emit F<slow_feedrate> ONCE.
-      Subsequent slow subsegments inherit that feedrate, no extra F.
-    - When we LEAVE a slow zone, we emit F<last_normal_F> ONCE on the first fast subsegment.
+    Returns (interp, z_min):
+
+    interp(x,y) ~ offset between 'transformed Z' and final printer Z.
+    z_min       ~ minimum z (used as floor so we don't go negative)
     """
+    stl_mesh = mesh.Mesh.from_file(stl_path)
 
-    new_data = []
+    P = stl_mesh.points.reshape((-1, 3))
+    # unique-ish points
+    # using rounding to avoid crazy duplicates / floating noise
+    P_uniq = np.unique(np.round(P, 6), axis=0)
 
-    pattern_X = r'X[-0-9.]+[.]?[0-9]*'
-    pattern_Y = r'Y[-0-9.]+[.]?[0-9]*'
-    pattern_Z = r'Z[-0-9.]+[.]?[0-9]*'
-    pattern_G = r'\AG[01]\s'   # G0/G1
+    # Build interpolator for z as a function of (x,y)
+    xy = P_uniq[:, :2]
+    z = P_uniq[:, 2]
+    tri = Delaunay(xy)
+    interp = LinearNDInterpolator(tri, z, fill_value=0.0)
 
-    # State across lines
-    x_old, y_old = 0.0, 0.0
-    z_layer = 0.0
-    in_perimeter = False
+    z_min = float(np.min(z))
 
-    # Feedrate state machine
-    last_normal_F = None   # last known "fast" feedrate
-    was_slow = False       # True if we're CURRENTLY in a slow zone
-
-    # Debug counters
-    perimeter_true_count = 0
-    total_subsegments = 0
-    subsegments_near_downward = 0
-    subsegments_slow_candidates = 0
-
-    for row in data:
-        stripped = row.strip()
-
-        # --- region classification via comments ---
-        if stripped.startswith(";"):
-            lower = stripped.lower()
-
-            prev = in_perimeter
-
-            # any "perimeter" keyword -> perimeter mode
-            if "perimeter" in lower:
-                in_perimeter = True
-
-            # any "infill" or " fill" (and not "perimeter") -> not perimeter
-            if "infill" in lower or ("fill" in lower and "perimeter" not in lower):
-                in_perimeter = False
-
-            if (in_perimeter is True) and (prev is False):
-                perimeter_true_count += 1
-
-            # comments don't affect feedrate state
-            new_data.append(row)
-            continue
-
-        # --- non-move lines ---
-        g_match = re.search(pattern_G, row)
-        if g_match is None:
-            # This could be e.g. "M204", "M220", or also a "G1 Fxxxx" without X/Y/Z.
-            # If there's an explicit feedrate here, we treat that as the slicer's
-            # normal feedrate and consider ourselves OUT of slow mode.
-            fval = extract_feedrate(row)
-            if fval is not None and abs(fval - slow_feedrate) > 1e-6:
-                last_normal_F = fval
-                was_slow = False  # printer is definitely not slow anymore after explicit slicer F
-            new_data.append(row)
-            continue
-
-        # Movement-command line (G0/G1 ...)
-
-        # Extract coords
-        x_match = re.search(pattern_X, row)
-        y_match = re.search(pattern_Y, row)
-        z_match = re.search(pattern_Z, row)
-
-        if (x_match is None and y_match is None and z_match is None):
-            # Still might be feedrate-only "G1 F..." kind of line.
-            fval = extract_feedrate(row)
-            if fval is not None and abs(fval - slow_feedrate) > 1e-6:
-                last_normal_F = fval
-                was_slow = False
-            new_data.append(row)
-            continue
-
-        # Update z_layer if this line provides a new slicer Z
-        if z_match is not None:
-            z_layer = float(z_match.group(0).replace('Z', ''))
-
-        # target XY for this move
-        x_new = x_old
-        y_new = y_old
-        if x_match is not None:
-            x_new = float(x_match.group(0).replace('X', ''))
-        if y_match is not None:
-            y_new = float(y_match.group(0).replace('Y', ''))
-
-        # Subdivide long XY moves
-        dist_xy = np.linalg.norm([x_new - x_old, y_new - y_old])
-        num_segm = max(int(dist_xy // maximal_length + 1), 1)
-
-        x_vals = np.linspace(x_old, x_new, num_segm + 1)
-        y_vals = np.linspace(y_old, y_new, num_segm + 1)
-
-        # compute final printer-space Z for each segment endpoint
-        z_vals = np.array([
-            np.maximum(z_layer - interp(x, y), z_min)
-            for (x, y) in zip(x_vals, y_vals)
-        ])
-
-        # Prepare a base row by injecting first Z and rescaling E for num_segm
-        base_row = insert_Z(row, z_vals[0])
-        base_row = replace_E(base_row, num_segm)
-
-        replacement_rows = ""
-
-        for j in range(num_segm):
-            sub_x = x_vals[j + 1]
-            sub_y = y_vals[j + 1]
-            sub_z = z_vals[j + 1]
-
-            # Construct one sub-move line
-            single_row = re.sub(pattern_X, 'X' + str(round(sub_x, 3)), base_row)
-            single_row = re.sub(pattern_Y, 'Y' + str(round(sub_y, 3)), single_row)
-            single_row = re.sub(pattern_Z, 'Z' + str(round(sub_z, 3)), single_row)
-
-            # Probe 3 points in final coord space
-            p_start = np.array([x_vals[j],     y_vals[j],     z_vals[j]])
-            p_mid   = np.array([
-                0.5 * (x_vals[j] + x_vals[j + 1]),
-                0.5 * (y_vals[j] + y_vals[j + 1]),
-                0.5 * (z_vals[j] + z_vals[j + 1])
-            ])
-            p_end   = np.array([x_vals[j + 1], y_vals[j + 1], z_vals[j + 1]])
-
-            if in_perimeter:
-                near_downward = segment_near_downward_surface(
-                    p_start,
-                    p_mid,
-                    p_end,
-                    tri_grid,
-                    cell_size,
-                    dist_tol=0.4
-                )
-                if near_downward:
-                    subsegments_near_downward += 1
-            else:
-                near_downward = False  # don't even bother testing geometry for infill/travel
-
-            slow_this = (in_perimeter and near_downward)
-            if slow_this:
-                subsegments_slow_candidates += 1
-
-            # --- FEEDRATE STATE MACHINE LOGIC ---
-
-            if slow_this:
-                # We're in a slow region.
-                # If we are ENTERING slow (was_slow was False), emit F180 ONCE.
-                if not was_slow:
-                    single_row = clean_and_set_feedrate(single_row, slow_feedrate)
-                    was_slow = True
-                else:
-                    # already slow: do NOT spam F180 again
-                    # just make sure there's a newline
-                    if not single_row.endswith("\n"):
-                        single_row = single_row.rstrip() + "\n"
-                # IMPORTANT: do NOT update last_normal_F from this line
-                # even if slicer feed was still present in the original row.
-            else:
-                # We're in a normal/fast region.
-                fval_here = extract_feedrate(single_row)
-
-                if was_slow:
-                    # We just EXITED slow region.
-                    # We MUST restore last_normal_F ONCE on this first fast segment.
-                    # Priority:
-                    # 1) if this line already has a feedrate from slicer that is != slow_feedrate,
-                    #    treat that as new normal and use it.
-                    # 2) else if we have a remembered last_normal_F, inject it.
-                    if fval_here is not None and abs(fval_here - slow_feedrate) > 1e-6:
-                        # slicer explicitly set a fast feedrate, so adopt it
-                        last_normal_F = fval_here
-                        was_slow = False
-                        # keep single_row as-is, because it already has fast F
-                        if not single_row.endswith("\n"):
-                            single_row = single_row.rstrip() + "\n"
-                    else:
-                        # slicer did not set a fast feedrate here
-                        # -> we inject our remembered fast feedrate
-                        if last_normal_F is not None:
-                            single_row = clean_and_set_feedrate(single_row, last_normal_F)
-                        else:
-                            # fallback: just newline
-                            if not single_row.endswith("\n"):
-                                single_row = single_row.rstrip() + "\n"
-                        was_slow = False
-                else:
-                    # We are in fast region and we were NOT slow just before.
-                    # Update last_normal_F if slicer sets a feedrate here.
-                    if fval_here is not None and abs(fval_here - slow_feedrate) > 1e-6:
-                        last_normal_F = fval_here
-                    # Make sure newline
-                    if not single_row.endswith("\n"):
-                        single_row = single_row.rstrip() + "\n"
-
-            replacement_rows += single_row
-            total_subsegments += 1
-
-        # update XY for next outer line
-        x_old = x_new
-        y_old = y_new
-
-        new_data.append(replacement_rows)
-
-    # Final debug print
     print("=== DEBUG backtransform_data ===")
-    print("perimeter_true_count:", perimeter_true_count,
-          "(how many times we switched into perimeter mode)")
-    print("total_subsegments:", total_subsegments)
-    print("subsegments_near_downward:", subsegments_near_downward,
-          "(geometry matched downward-facing triangles)")
-    print("subsegments_slow_candidates:", subsegments_slow_candidates,
-          "(perimeter AND downward -> triggered slow zone)")
+    print("Source STL:", stl_path)
+    print("Unique points:", len(P_uniq))
+    print("Z-min for safety floor:", z_min)
 
-    return new_data
+    return interp, z_min
 
 
 #############################
-# transformGCode main entry
+# Main pipeline: transformGCode
 #############################
 
 def transformGCode(
@@ -584,110 +349,335 @@ def transformGCode(
     in_transform_for_interp,
     out_dir,
     surface_for_slowdown,
-    maximal_length = 1.0,
-    x_shift = 0.0,
-    y_shift = 0.0,
-    z_desired = 0.1,
-    downward_angle_deg = 10.0,
-    slow_feedrate = 180.0
+    maximal_length=1.0,
+    x_shift=0.0,
+    y_shift=0.0,
+    z_desired=0.1,
+    downward_angle_deg=10.0,
+    slow_feedrate=180.0,
+    medium_feedrate=400.0
 ):
     """
     Convert SuperSlicer output in transformed coordinates (in_file)
     into final printer-space G-code.
+
+    Steps:
+    - Build interpolator from tf_surface STL to "backtransform" Z.
+    - Analyse final part mesh to detect downward-facing regions.
+    - For each G1 move:
+        * split long XY moves into subsegments <= maximal_length
+        * compute final Z for each segment using backtransform
+        * slow down perimeters that are under overhang / downward faces
+        * insert recovery feedrate when leaving slow region
+        * ensure Z is always in the line
+        * recalc extrusion E proportionally
 
     Parameters
     ----------
     in_file : str
         Path to G-code in transformed coordinates (gcode_tf/<part>.gcode)
     in_transform_for_interp : str
-        Path to the "tf_surfaces/<part>.stl" surface that defines Z offset.
-        We still use this for building 'interp' to backtransform Z.
+        Path to the "tf_surfaces/<part>.stl" surface used to build height map.
     out_dir : str
-        Output dir for final G-code (gcode_parts/)
+        Output directory for final G-code (gcode_parts/)
     surface_for_slowdown : str
         Path to the FINAL geometry STL (stl_parts/<part>.stl).
         We analyze this mesh to detect downward-facing regions and slow perimeters.
     maximal_length : float
         Max XY segment length before we subdivide
     x_shift, y_shift : float
-        (Currently unused in the math below; could be applied after if needed)
+        (Currently unused in final coords but kept for compatibility)
     z_desired : float
-        Minimal Z height (z_min clamp). Your pipeline used z_desired+0.2 previously.
+        Base desired Z offset? (kept for compatibility)
     downward_angle_deg : float
-        Max angle from -Z for a triangle to count as "downward"
-        (in FINAL geometry space)
+        Triangles whose normals point within this angle of -Z are considered
+        "downward" → triggers slowdown.
     slow_feedrate : float
-        Feedrate [mm/min] to enforce on downward-facing perimeter moves.
+        Feedrate (F value) to use in downward-facing perimeter segments
+    medium_feedrate : float
+        Feedrate to use for normal perimeters when forcing medium speed in
+        buffered perimeter flush
 
     Output
     ------
-    Writes a final G-code file in out_dir with same basename as in_file.
+    Writes a new G-code file <out_dir>/<basename>.gcode_final.gcode
     """
+    os.makedirs(out_dir, exist_ok=True)
 
-    start = time.time()
+    ## 1. Backtransform interpolator
+    interp, z_min = _backtransform_data(in_transform_for_interp)
 
-    # 1. Read original (transformed) G-code
-    with open(in_file, 'r') as f_gcode:
-        data = f_gcode.readlines()
-
-    # 2. Build interpolation surface for Z backtransform using tf_surfaces mesh
-    surf = mesh.Mesh.from_file(in_transform_for_interp).vectors
-    surf_xy = np.reshape(surf[:, :, [0, 1]], (-1, 2))
-    delaunay_grid = Delaunay(surf_xy)
-    interp = LinearNDInterpolator(delaunay_grid,
-                                  np.reshape(surf[:, :, 2], -1),
-                                  0)
-
-    # 3. Load final-part mesh (stl_parts/*.stl) and extract downward-facing triangles
-    downward_triangles = triangle_data_from_mesh(
+    ## 2. Downward-facing surface analysis (for slowdown)
+    tris_down = _triangle_data_from_mesh(
         surface_for_slowdown,
         max_angle_deg=downward_angle_deg
     )
+    tri_grid, tri_cell = _build_triangle_spatial_index(tris_down, cell_size=1.0)
 
-    # build spatial index once
-    tri_grid, cell_size = build_triangle_spatial_index(
-        downward_triangles,
-        cell_size=2.0   # you can tune this, 2.0mm is a decent start
-    )
+    ## 3. Read source G-code
+    with open(in_file, 'r') as f:
+        gcode_lines = f.readlines()
 
-    # 4. Backtransform + slowdown logic
-    data_bt = backtransform_data(
-        data,
-        interp,
-        maximal_length,
-        z_desired + 0.2,
-        tri_grid,
-        cell_size,
-        slow_feedrate=slow_feedrate
-    )    
+    out_lines = []
+
+    # We'll maintain a buffer for "normal perimeter lines" so we can rewrite
+    # feedrates at the right time when leaving slow regions.
+    buffered_row = None
+    buffered_is_extruding = False
+    buffered_is_slow = False
+
+    was_slow = False        # were we in slow mode last subsegment?
+    last_normal_F = None    # last known fast feedrate we saw in non-slow segments
+
+    # debug counters
+    perimeter_true_count = 0
+    total_subsegments = 0
+    subsegments_near_downward = 0
+    subsegments_slow_candidates = 0
+
+    def flush_buffer(row_list, force_medium=False):
+        """
+        Push the current buffered_row into row_list.
+        - If force_medium is True and the buffered row is extruding and NOT slow,
+          we rewrite its feedrate to medium_feedrate.
+        - After flushing, clear the buffer.
+        """
+        nonlocal buffered_row, buffered_is_extruding, buffered_is_slow
+
+        if buffered_row is None:
+            return
+
+        out_line = buffered_row
+
+        if force_medium and buffered_is_extruding and (not buffered_is_slow):
+            # Remove any F... and replace with F<medium_feedrate>
+            out_line = _clean_and_set_feedrate(out_line, medium_feedrate)
+
+        row_list.append(out_line)
+
+        buffered_row = None
+        buffered_is_extruding = False
+        buffered_is_slow = False
+
+    def set_buffer(line, is_extruding, is_slow):
+        """
+        Update the single-line buffer with new row.
+        """
+        nonlocal buffered_row, buffered_is_extruding, buffered_is_slow
+        buffered_row = line
+        buffered_is_extruding = is_extruding
+        buffered_is_slow = is_slow
+
+    # We'll track XY position layer by layer (SuperSlicer style)
+    x_old = 0.0
+    y_old = 0.0
+    z_layer = 0.0
+
+    # regex patterns reused in loop
+    pattern_G1 = r'^G1\b'
+    pattern_X = r'X[-0-9.]+[.]?[0-9]*'
+    pattern_Y = r'Y[-0-9.]+[.]?[0-9]*'
+    pattern_Z = r'Z[-0-9.]+[.]?[0-9]*'
+    pattern_E = r'E[-0-9.]+[.]?[0-9]*'
+    pattern_COMMENT_PERIM = r';TYPE:Perimeter'
+
+    for row in gcode_lines:
+        row_stripped = row.strip()
+
+        # Track layer Z if slicer sets it (e.g. "G1 Z...")
+        z_match = re.search(pattern_Z, row)
+        if z_match is not None:
+            try:
+                z_layer = float(z_match.group(0).replace('Z', ''))
+            except ValueError:
+                pass
+
+        # Not a motion line? Just flush any buffer if needed and pass it through.
+        if re.search(pattern_G1, row) is None or \
+           (re.search(pattern_X, row) is None and re.search(pattern_Y, row) is None):
+
+            # Before dumping arbitrary non-G1 or travel, flush buffer
+            flush_buffer(out_lines, force_medium=False)
+            out_lines.append(row)
+            continue
+
+        # It's a movement (G1...), maybe extrusion.
+        # We get new X,Y targets
+        x_match = re.search(pattern_X, row)
+        y_match = re.search(pattern_Y, row)
+
+        x_new = x_old
+        y_new = y_old
+        if x_match is not None:
+            x_new = float(x_match.group(0).replace('X', ''))
+        if y_match is not None:
+            y_new = float(y_match.group(0).replace('Y', ''))
+
+        # break long XY move into small segments
+        dist_xy = np.linalg.norm([x_new - x_old, y_new - y_old])
+        num_segm = max(int(dist_xy // maximal_length + 1), 1)
+
+        x_vals = np.linspace(x_old, x_new, num_segm + 1)
+        y_vals = np.linspace(y_old, y_new, num_segm + 1)
+
+        # backtransform Z for each segment endpoint
+        z_vals = np.array([
+            np.maximum(z_layer - interp(xv, yv), z_min)
+            for (xv, yv) in zip(x_vals, y_vals)
+        ])
+
+        # base row template:
+        base_row = _insert_Z(row, z_vals[0])
+        base_row = _replace_E(base_row, num_segm)
+
+        for j in range(num_segm):
+            sub_x = x_vals[j + 1]
+            sub_y = y_vals[j + 1]
+            sub_z = z_vals[j + 1]
+
+            # coordinate-substituted single subsegment line
+            single_row = re.sub(pattern_X, 'X' + str(round(sub_x, 3)), base_row)
+            single_row = re.sub(pattern_Y, 'Y' + str(round(sub_y, 3)), single_row)
+            single_row = re.sub(pattern_Z, 'Z' + str(round(sub_z, 3)), single_row)
+
+            # Mark if this subsegment is extruding:
+            is_extruding = (re.search(pattern_E, single_row) is not None)
+
+            # We only consider slowdowns on "perimeter" lines with extrusion.
+            is_perimeter = (re.search(pattern_COMMENT_PERIM, row) is not None)
+            if is_perimeter and is_extruding:
+                perimeter_true_count += 1
+
+            total_subsegments += 1
+
+            # We check if this subsegment is near downward-facing geometry
+            # Use midpoint of this subsegment, keep same Z for test.
+            mid_x = (x_vals[j] + x_vals[j + 1]) * 0.5
+            mid_y = (y_vals[j] + y_vals[j + 1]) * 0.5
+            mid_z = (z_vals[j] + z_vals[j + 1]) * 0.5
+            p_mid = np.array([mid_x, mid_y, mid_z], dtype=float)
+
+            # Only if this is perimeter & extruding do we consider slowdown:
+            near_down = False
+            if is_perimeter and is_extruding:
+                near_down = _point_near_downward_surface(
+                    p_mid,
+                    tri_grid,
+                    tri_cell,
+                    dist_threshold=0.4
+                )
+                if near_down:
+                    subsegments_near_downward += 1
+
+            # Candidate for slow? => near downward-facing
+            is_slow_candidate = (near_down and is_perimeter and is_extruding)
+            if is_slow_candidate:
+                subsegments_slow_candidates += 1
+
+            # logic for slow feedrate injection and buffering:
+            if is_slow_candidate:
+                # We're in "slow" mode for this subsegment
+
+                # flush whatever was buffered, forcing medium feed if appropriate
+                flush_buffer(out_lines, force_medium=True)
+
+                # Force slow feedrate on this single_row
+                single_row_slow = _clean_and_set_feedrate(single_row, slow_feedrate)
+
+                # output the slow row immediately
+                if not single_row_slow.endswith("\n"):
+                    single_row_slow = single_row_slow.rstrip() + "\n"
+                out_lines.append(single_row_slow)
+
+                was_slow = True
+
+                # nach Ausgabe des slow-Segments kommt KEIN Buffer,
+                # weil wir ihn schon geflusht haben und slow-Zeilen direkt schreiben
+                set_buffer(None, False, False)
+
+            else:
+                # Dieses Subsegment ist NICHT slow.
+                fval_here = _extract_feedrate(single_row)
+
+                if was_slow:
+                    # Wir verlassen gerade den Slow-Bereich.
+                    # Wir müssen EINMAL die schnelle Feedrate wiederherstellen.
+                    # Falls der Slicer hier schon eine schnelle F hat (fval_here != slow_feedrate),
+                    # nehmen wir die. Sonst nehmen wir last_normal_F.
+                    if fval_here is not None and abs(fval_here - slow_feedrate) > 1e-6:
+                        # slicer hat eine schnelle Feedrate gesetzt
+                        last_normal_F = fval_here
+                        restored = single_row
+                        if not restored.endswith("\n"):
+                            restored = restored.rstrip() + "\n"
+                    else:
+                        # slicer hat hier keine schnelle F -> wir injizieren last_normal_F
+                        if last_normal_F is not None:
+                            restored = _clean_and_set_feedrate(single_row, last_normal_F)
+                        else:
+                            # fallback: einfach nur newline
+                            restored = single_row
+                            if not restored.endswith("\n"):
+                                restored = restored.rstrip() + "\n"
+
+                    # Dieser 'restored' Move wird NICHT gebuffert:
+                    flush_buffer(out_lines, force_medium=False)
+                    out_lines.append(restored)
+
+                    was_slow = False
+                    # Buffer bleibt leer nach diesem Schritt
+                    set_buffer(None, False, False)
+
+                else:
+                    # Wir sind NICHT im slow-Bereich (und waren es auch nicht gerade).
+                    # Wir puffern diese Zeile (max 1 Zeile Buffer).
+                    # Warum? Damit wir ggf. beim nächsten Step merken,
+                    # dass wir DOCH slow werden und dann medium-feedrate setzen können.
+                    if fval_here is not None and abs(fval_here - slow_feedrate) > 1e-6:
+                        last_normal_F = fval_here
+
+                    # Flush vorherige Pufferzeile, ohne medium-Force
+                    flush_buffer(out_lines, force_medium=False)
+
+                    # Neue Zeile in Buffer legen
+                    if not single_row.endswith("\n"):
+                        single_row = single_row.rstrip() + "\n"
+                    set_buffer(single_row, is_extruding, False)
+
+        # update state for next segment
+        x_old = x_new
+        y_old = y_new
+
+    # am Ende alles flushen
+    flush_buffer(out_lines, force_medium=False)
+
+    # Debug-Ausgabe
+    print("=== transformGCode stats ===")
+    print("Input file:", in_file)
+    print("Total subsegments:", total_subsegments)
+    print("Perimeter+extrusion subsegments:", perimeter_true_count)
+    print("Near downward subsegments:", subsegments_near_downward)
+    print("Slowdown candidates:", subsegments_slow_candidates)
+
+    # Write output file
+    base_name = os.path.basename(in_file)
+    out_name = base_name.replace('.gcode', '') + "_final.gcode"
+    out_path = os.path.join(out_dir, out_name)
+
+    with open(out_path, 'w') as fw:
+        fw.writelines(out_lines)
+
+    print("Wrote transformed G-code to:", out_path)
+
+    return out_path
 
 
-
-
-    data_bt_string = ''.join(data_bt)
-
-
-
-    # 5. Save final backtransformed code
-    os.makedirs(out_dir, exist_ok=True)
-    file_name = os.path.basename(in_file)  # e.g. "test_2.gcode"
-    output_path = os.path.join(out_dir, file_name)
-
-    with open(output_path, 'w', newline="\n") as f_gcode_bt:
-        f_gcode_bt.write(data_bt_string)
-
-    end = time.time()
-    print('GCode generated in {:.1f}s, saved in {}'.format(end - start, output_path))
-
-
-
-# Standalone test hook (optional)
 if __name__ == "__main__":
-    # Example dummy paths; adjust to something that exists in your structure
-    file_path = 'gcode_tf/Body2.gcode'
-    tf_surface = 'tf_surfaces/Body2.stl'
-    final_part = 'stl_parts/Body2.stl'
-    out_dir = 'gcode_parts'
+    # Basic manual test hook (adjust paths for your environment)
+    file_path = "gcode_tf/part.gcode"
+    tf_surface = "tf_surfaces/part.stl"
+    final_part = "stl_parts/part.stl"
+    out_dir = "gcode_parts"
 
     transformGCode(
         in_file=file_path,
@@ -699,5 +689,6 @@ if __name__ == "__main__":
         y_shift=0.0,
         z_desired=0.1,
         downward_angle_deg=10.0,
-        slow_feedrate=180.0
+        slow_feedrate=180.0,
+        medium_feedrate=400.0
     )

@@ -4,9 +4,6 @@ from matplotlib import pyplot
 import numpy as np
 import sys
 
-# Defaults
-file_stl = "test.stl"
-file_cuts = "cuts.txt"
 
 def analyseSTL(in_stl, out_cuts, cutoffangle = 45, mincutheight = 5, debug = True):
     """
