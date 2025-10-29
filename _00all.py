@@ -122,7 +122,6 @@ def _backtransform_and_slowdown(
     max_seg_len   = GEOMETRY_CONFIG["maximal_segment_length_mm"]
     down_angle    = GEOMETRY_CONFIG["downward_angle_deg"]
     slow_feed     = GEOMETRY_CONFIG["slow_feedrate_mm_per_min"]
-    medium_feed     = GEOMETRY_CONFIG["medium_feedrate_mm_per_min"]
     z_min         = GEOMETRY_CONFIG["z_desired_min_mm"]
     xy_shift_x, xy_shift_y = GEOMETRY_CONFIG["xy_backtransform_shift_mm"]
 
@@ -151,7 +150,6 @@ def _backtransform_and_slowdown(
         z_desired=z_min,
         downward_angle_deg=down_angle,
         slow_feedrate=slow_feed,
-        medium_feedrate=medium_feed
     )
 
 
