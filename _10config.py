@@ -215,6 +215,8 @@ SLICER_CONFIG = {
     # Tuning for transformed (nonplanar) parts.
     "transformed_extra_args": [
 
+        "--external-perimeter-speed", "8",
+        
         "--bridge-flow-ratio", "0.5",
 
         "--extrusion-width", "0.3",
@@ -225,7 +227,7 @@ SLICER_CONFIG = {
         "--top-infill-extrusion-width", "0.3",
 
         "--perimeters", "4",
-        "--extrusion-multiplier", "0.9",
+        "--extrusion-multiplier", "1.0",
         "--solid-infill-below-area", "0",
 
         "--bottom-solid-layers", "1",
