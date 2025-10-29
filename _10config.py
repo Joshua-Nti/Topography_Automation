@@ -225,7 +225,6 @@ SLICER_CONFIG = {
         "--top-infill-extrusion-width", "0.3",
 
         "--perimeters", "4",
-        "--extrusion-multiplier", "0.9",
         "--solid-infill-below-area", "0",
 
         "--bottom-solid-layers", "1",
