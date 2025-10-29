@@ -8,7 +8,7 @@ import sys
 file_stl = "test.stl"
 file_cuts = "cuts.txt"
 
-def analyseSTL(in_stl, out_cuts, cutoffangle = 45, mincutheight = 5, debug = False):
+def analyseSTL(in_stl, out_cuts, cutoffangle = 45, mincutheight = 5, debug = True):
     """
     Decide the cutting heights for a given stl file
     Faces steeper than the cuttoffangle are grouped together in z-direction if continuous. 
