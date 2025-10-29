@@ -104,6 +104,7 @@ GEOMETRY_CONFIG = {
     # Feedrate [mm/min] for perimeters above downward-facing regions.
     # We inject F<slow_feedrate> once when entering the slow zone.
     "slow_feedrate_mm_per_min": 180.0,
+    "medium_feedrate_mm_per_min": 400.0,
 
     # Minimal allowed Z after backtransform. This clamps the toolpath upward
     # to avoid diving below a desired safety plane.
@@ -215,7 +216,7 @@ SLICER_CONFIG = {
     # Tuning for transformed (nonplanar) parts.
     "transformed_extra_args": [
 
-        "--external-perimeter-speed", "8",
+        # "--external-perimeter-speed", "8",
         
         "--bridge-flow-ratio", "0.5",
 
