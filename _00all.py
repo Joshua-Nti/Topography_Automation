@@ -17,16 +17,17 @@ from _10config import (
     make_folder_dict,
     GEOMETRY_CONFIG,
     PIPELINE_CONFIG,
+    ANALYSE_STL,
 )
 
 # default entry if user doesn't pass an STL
-in_file = "test.stl"
+# You can override this via ANALYSE_STL['input_stl'] in _10config.py
+in_file = ANALYSE_STL.get("input_stl", "test.stl")
 
 
-def sliceTransform(folder, filename, bottom=False, top=False):
+def sliceTransform(folder, filename, bottom=False, top=False, transform_flag=True):
     """
     Process a single STL part file:
-    - create a coarse copy for slowdown detection
     - refine mesh
     - apply transform if tf_surface exists
     - slice with SuperSlicer
@@ -47,14 +48,11 @@ def sliceTransform(folder, filename, bottom=False, top=False):
     stl_tf_path      = os.path.join(folder["stl_tf"],      part_name + ".stl")
     gcode_tf_path    = os.path.join(folder["gcode_tf"],    part_name + ".gcode")
     gcode_parts_path = os.path.join(folder["gcode_parts"], part_name + ".gcode")
-    coarse_stl_path  = os.path.join(folder["stl_coarse"],  part_name + ".stl")
 
-    # A part is considered "nonplanar" if there's a matching transform surface.
-    is_nonplanar = os.path.exists(tf_surfaces_path)
+    # A part is considered "nonplanar" if it is marked in cuts.txt (transform_flag)
+    # AND there is a matching transform surface STL.
+    is_nonplanar = bool(transform_flag) and os.path.exists(tf_surfaces_path)
 
-    # Coarse copy (for slowdown geometry). We keep the original, unrefined STL here.
-    if not os.path.exists(coarse_stl_path):
-        shutil.copyfile(stl_parts_path, coarse_stl_path)
 
     # Step 1: refine mesh if we are going to transform
     # (We keep the same logic you had: refine only for nonplanar parts,
@@ -83,7 +81,7 @@ def sliceTransform(folder, filename, bottom=False, top=False):
             gcode_tf_path,
             tf_surfaces_path,
             folder["gcode_parts"],
-            coarse_stl_path,
+            stl_parts_path,
         )
 
     else:
@@ -122,22 +120,9 @@ def _backtransform_and_slowdown(
     max_seg_len   = GEOMETRY_CONFIG["maximal_segment_length_mm"]
     down_angle    = GEOMETRY_CONFIG["downward_angle_deg"]
     slow_feed     = GEOMETRY_CONFIG["slow_feedrate_mm_per_min"]
+    medium_feed   = GEOMETRY_CONFIG["medium_feedrate_mm_per_min"]
     z_min         = GEOMETRY_CONFIG["z_desired_min_mm"]
     xy_shift_x, xy_shift_y = GEOMETRY_CONFIG["xy_backtransform_shift_mm"]
-
-    # NOTE: our transformGCode signature from before was:
-    # transformGCode(
-    #   in_file,
-    #   in_transform_for_interp,
-    #   out_dir,
-    #   surface_for_slowdown,
-    #   maximal_length = ...,
-    #   x_shift = ...,
-    #   y_shift = ...,
-    #   z_desired = ...,
-    #   downward_angle_deg = ...,
-    #   slow_feedrate = ...
-    # )
 
     transformGCode(
         in_file=gcode_in,
@@ -150,10 +135,11 @@ def _backtransform_and_slowdown(
         z_desired=z_min,
         downward_angle_deg=down_angle,
         slow_feedrate=slow_feed,
+        medium_feedrate=medium_feed
     )
 
 
-def sliceAll(folder):
+def sliceAll(folder, segments_to_transform=None):
     """
     Go through all stl_parts/*.stl in sort order.
     Mark first as bottom=True, last as top=True,
@@ -172,18 +158,57 @@ def sliceAll(folder):
     for idx, stlfile in enumerate(parts):
         bottom_flag = (idx == 0)
         top_flag    = (idx == len(parts) - 1)
+        seg_index   = idx + 1  # segments are numbered 1..N in cuts.txt
 
-        print("Processing:",
-              stlfile,
-              "| bottom =", bottom_flag,
-              "| top =", top_flag)
+        # Decide whether this segment should be treated as nonplanar
+        if segments_to_transform is None:
+            transform_flag = True
+        else:
+            transform_flag = str(seg_index) in segments_to_transform
+
+        print(
+            "Processing:", stlfile,
+            "| index =", seg_index,
+            "| bottom =", bottom_flag,
+            "| top =", top_flag,
+            "| transform =", transform_flag,
+        )
 
         sliceTransform(
             folder,
             stlfile,
             bottom=bottom_flag,
             top=top_flag,
+            transform_flag=transform_flag,
         )
+
+
+def read_segments_to_transform(cuts_file):
+    """Read cuts.txt and return list of segment IDs where flag == '1'.
+
+    Expected file format per line:
+        <segment_index> <flag> <z_value>
+
+    Example:
+        1 0 20.0000
+        2 1 30.0000
+        3 1 37.6410
+        4 1 45.3000
+        5 1 TOP
+    """
+    segments = []
+    if not os.path.exists(cuts_file):
+        print(f"[read_segments_to_transform] WARNING: file not found: {cuts_file}")
+        return segments
+
+    with open(cuts_file, "r") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "1":
+                segments.append(parts[0])
+
+    print(f"[read_segments_to_transform] Segments to transform: {segments}")
+    return segments
 
 
 def createFoldersIfMissing(folder_dict):
@@ -238,9 +263,13 @@ def main(input_stl):
         out_folder=folders["stl_parts"],
     )
 
+    # Determine which segments should be transformed (from cuts.txt)
+    print("Read segments to transform from cuts.txt …")
+    segments_to_transform = read_segments_to_transform(cuts_txt_path)
+
     # Slice all parts (and transform/backtransform where needed)
     print("Slice all parts …")
-    sliceAll(folders)
+    sliceAll(folders, segments_to_transform=segments_to_transform)
 
     # Combine final segments' G-code into one combined file
     combined_gcode_path = os.path.join(folders["root"], base_name + ".gcode")
@@ -251,11 +280,14 @@ def main(input_stl):
     )
 
     # Optionally apply final XY shift
-    shifted_gcode_path = os.path.join(folders["root"], base_name + "_moved.gcode")
-
     if PIPELINE_CONFIG["apply_final_shift"]:
         print("Apply final XY shift to merged G-code …")
         x_off, y_off = PIPELINE_CONFIG["final_shift_xy_mm"]
+
+        # place the shifted file in the SAME directory as the input STL (one level above 'test/')
+        project_root = os.path.dirname(folders["root"])
+        shifted_gcode_path = os.path.join(project_root, base_name + "_moved.gcode")
+
         moveGCode(
             in_file=combined_gcode_path,
             out_file=shifted_gcode_path,

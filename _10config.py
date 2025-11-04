@@ -74,7 +74,6 @@ def make_folder_dict(base_name):
     return {
         "root":         os.path.join(root_dir),
         "stl_parts":    os.path.join(root_dir, "stl_parts"),
-        "stl_coarse":   os.path.join(root_dir, "stl_coarse"),
         "stl_tf":       os.path.join(root_dir, "stl_tf"),
         "tf_surfaces":  os.path.join(root_dir, "tf_surfaces"),
         "gcode_tf":     os.path.join(root_dir, "gcode_tf"),
@@ -95,7 +94,7 @@ GEOMETRY_CONFIG = {
     # Max XY length [mm] of each linear toolpath subsegment after subdivision
     # during backtransform. Smaller = more accurate following of surface,
     # but more G-code.
-    "maximal_segment_length_mm": 2.0,
+    "maximal_segment_length_mm": 0.6,
 
     # Angle tolerance [deg] for detecting downward-facing triangles.
     # Triangles whose normal is within this angle of -Z (downwards) are "critical".
@@ -104,6 +103,7 @@ GEOMETRY_CONFIG = {
     # Feedrate [mm/min] for perimeters above downward-facing regions.
     # We inject F<slow_feedrate> once when entering the slow zone.
     "slow_feedrate_mm_per_min": 180.0,
+    "medium_feedrate_mm_per_min": 400.0,
 
     # Minimal allowed Z after backtransform. This clamps the toolpath upward
     # to avoid diving below a desired safety plane.
@@ -215,7 +215,7 @@ SLICER_CONFIG = {
     # Tuning for transformed (nonplanar) parts.
     "transformed_extra_args": [
 
-        "--external-perimeter-speed", "8",
+        # "--external-perimeter-speed", "8",
         
         "--bridge-flow-ratio", "0.5",
 
@@ -241,6 +241,40 @@ SLICER_CONFIG = {
     "default_top_solid_layers": 1,
     "default_end_gcode": "",
 }
+
+# ---------------------------------------------------------------------------
+#  ANALYSE STL SETTINGS (for _01analysestl.py)
+# ---------------------------------------------------------------------------
+
+ANALYSE_STL = {
+    "input_stl": "Test.stl",
+
+    # 1. Overhang detection
+    # A face is considered “downward” if its normal vector is within this
+    # angle (degrees) of the -Z axis.
+    "overhang_angle_deg": 15.0,
+
+    # 2. Bridge span threshold in XY (mm)
+    # Clusters of downward-facing triangles wider than this are considered
+    # serious overhangs or large bridges and will trigger their own segment.
+    "bridge_span_mm_min": 6.0,
+
+    # 3. Vertical offset for cut (mm)
+    # How far BELOW the first unsupported Z we place the cutting plane.
+    "cut_below_mm": 1.0,
+
+    # 4. Minimum distance (mm) between two cuts
+    # If multiple cut candidates are closer than this, we keep only the LOWER one.
+    "min_segment_height_mm": 4.0,
+
+    # 5. Maximum vertical height (mm) allowed for a single nonplanar segment
+    # Segments flagged as transform=1 will be subdivided internally if taller.
+    "max_transform_segment_height_mm": 5.0,
+
+    # Optional: toggle for visualization in standalone mode
+    "show_debug_plot": False,
+}
+
 
 
 # ---------------------------------------------------------------------------
