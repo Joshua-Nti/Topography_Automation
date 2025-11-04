@@ -5,41 +5,54 @@ from _10config import get_slic3r_binary, CUT_CONFIG
 
 def _read_cut_heights(cuts_file):
     """
-    Read cut heights [mm] from cuts.txt.
+    Read cut heights [mm] from the new cuts.txt format.
+
+    Supported lines:
+        <segment_index> <flag> <z_value>
+    Example:
+        1 0 20.0000
+        2 1 30.0000
+        3 1 37.6410
+        4 1 45.3000
+        5 1 TOP
 
     Behavior:
-    - Parse each non-empty line as float (comma or dot decimal).
-    - Drop duplicates.
-    - Sort ascending.
-    - Drop heights at or below CUT_CONFIG["ignore_cuts_at_or_below_mm"].
-      (This handles the "0 mm should not force a cut" rule.)
-
-    Returns
-    -------
-    cuts_sorted : list[float]
-        e.g. [21.0, 25.7, 38.0, 46.3, 49.5]
+    - Extracts the third value in each line (the Z height).
+    - Ignores lines with "TOP" or malformed data.
+    - Removes duplicates.
+    - Sorts ascending.
+    - Drops heights <= CUT_CONFIG["ignore_cuts_at_or_below_mm"].
     """
-    ignore_min = CUT_CONFIG.get("ignore_cuts_at_or_below_mm", 0.0)
 
+    ignore_min = CUT_CONFIG.get("ignore_cuts_at_or_below_mm", 0.0)
     raw_vals = []
+
     with open(cuts_file, "r") as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#"):
                 continue
-            # accept "25,7" as "25.7"
-            line = line.replace(",", ".")
+
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+            val = parts[2]
+            if val.upper() == "TOP":
+                continue
+
+            # accept both comma and dot decimals
+            val = val.replace(",", ".")
+
             try:
-                z_val = float(line)
+                z_val = float(val)
             except ValueError:
                 continue
-            # apply ignore threshold
+
             if z_val > ignore_min:
                 raw_vals.append(z_val)
 
-    # unique + sort ascending
     raw_vals = sorted(set(raw_vals))
-
     return raw_vals
 
 
